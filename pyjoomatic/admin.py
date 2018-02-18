@@ -1,4 +1,8 @@
-from urllib.parse import urljoin, urlparse, parse_qs
+import contextlib
+import os
+import re
+import time
+from urllib.parse import urljoin, urlparse, parse_qs, urlencode, urlunparse
 
 from selenium import webdriver
 from selenium.common.exceptions import NoSuchElementException
@@ -10,6 +14,7 @@ from selenium.webdriver.support import expected_conditions as ec
 
 
 ec_presence = ec.presence_of_element_located
+ec_frame_available = ec.frame_to_be_available_and_switch_to_it
 
 
 class AdminError(Exception):
@@ -37,7 +42,7 @@ def no_such_element_default(fn):
     return decorated
 
 
-def chord(ctrl_keys, key):
+def chord(ctrl_keys, key, driver):
     """pressing multiple controlers and a key at the same time
 
     :param list ctrl_keys: controlers keys
@@ -194,12 +199,49 @@ class JoomlaFormDriver:
     """An helper to deal with joomla forms and their peculiarities
     """
 
-    def fill_input(self, fname, field, value):
-        """fill a simple imput
+    def ensure_field_tab(self, field):
+        """ensure tab containing field is active
         """
+        if not field.is_displayed():
+            try:
+                # find tab
+                tab = field.by_xpath("./ancestor::div[contains(@class, 'tab-pane')]")
+                # click on link
+                if tab:
+                    tabid = tab.get_attribute('id')
+                    tab_selector = self.b.by_xpath("//ul[@id='myTabTabs']//a[@href='#%s']" % tabid)
+                    if tab_selector and tab_selector.is_displayed():
+                        tab_selector.click()
+            except NoSuchElementException:
+                pass
+
+    def fill_input(self, fname, field, value):
+        """redispatch on type
+        """
+        ftype = field.get_attribute("type") or "text"
+        filler = getattr(self, "fill_input_" + ftype, self.fill_input_text)
+        filler(fname, field, value)
+
+    def fill_input_text(self, fname, field, value):
         field.clear()
         field.send_keys(value)
-        
+
+    def fill_input_file(self, fname, field, value):
+        field.clear()
+        # verify file exists
+        fpath = os.path.abspath(value)
+        if not os.path.exists(fpath):
+            raise ValueError("%s does not exists, can't feed it as an upload value" % value)
+        if not os.path.isfile(fpath):
+            raise ValueError("%s is not a file, can't feed it as an upload value" % value)
+        # ok
+        field.send_keys(fpath)
+
+    def fill_input_radio(self, fname, field, value):
+        fvalue = field.get_attribute(value)
+        if str(fvalue) == str(value):
+            field.click()  # select it
+
     def fill_select(self, fname, field, value):
         """helper to select a value, even if the field is rendered with a search box
         """
@@ -223,6 +265,55 @@ class JoomlaFormDriver:
             # click it
             results[0].click()
 
+    def select_article_in_popup(self, article_id, article_title, fname="jSelectArticle"):
+        """Generic function to select article when we have a search popup
+        """
+        popup_xpath = "//iframe[contains(@src, 'function=%s')]" % fname
+        self.b.wait().until(ec_frame_available((By.XPATH, popup_xpath)))
+        # wait a bit for the switch to happen !
+        time.sleep(1)
+        # self.b.wait().until(ec_presence((By.XPATH, '//a[contains(@onclick, "%s(")]')))
+        # find article id
+        link_xpath = """//a[contains(@onclick, "%s('%s'")][1]""" % (fname, int(article_id))
+        try:
+            link = self.b.by_xpath(link_xpath)
+        except NoSuchElementException:
+            # search title
+            search_field = self.b.by_name("filter[search]")
+            search_field.clear()
+            search_field.send_keys(article_title)
+            search_field.by_xpath("./following-sibling::button").click()
+            # wait for link
+            link = self.b.wait().until(ec_presence((By.XPATH, link_xpath)))
+        # select article
+        link.click()
+        # wait for window to disapear
+        self.b.wait().until_not(ec_presence((By.XPATH, popup_xpath)))
+        # go back to parent frame
+        self.b.switch_to.parent_frame();
+        # wait a bit for the switch to happen !
+        time.sleep(1)
+
+    def fill_association(self, fname, value):
+        """helper to fill an association
+
+        :param fname: should be filename[lang]
+        :param str value: have to be in the form "element_id - text to search"
+        """
+        fname, lang_code = re.split((r"\[|\]"), fname)[:2]
+        field = self.b.by_name("jform[%s][%s]" % (fname, lang_code.replace("_", "-")))
+        self.ensure_field_tab(field)
+        # click button akin to field
+        button = field.by_xpath("..//a")
+        button.click()
+        _article_id, _article_title = value.split("-", 1)
+        article_id = int(_article_id)
+        article_title = _article_title.strip()
+        # wait for popup and select
+        fname = "jSelectArticle_jform_associations_%s" % lang_code
+        self.select_article_in_popup(
+            article_id, article_title, fname=fname)
+
     def fill_textarea(self, fname, field, value):
         """helper to fill a text, dealing with the rich editor (disabling it)
         """
@@ -242,9 +333,12 @@ class JoomlaFormDriver:
         """Generic method to fill a field in a form, choosing the right method for that
         """
         fname = "jform[%s]" % name if jform else name
-        field = self.b.by_name(fname)
-        filler = getattr(self, "fill_" + field.tag_name)
-        filler(name, field, value)
+        fields = self.b.all_name(fname)  # radio eg have multiple fields
+        for field in fields:
+            field = fields[0]
+            self.ensure_field_tab(field)
+            filler = getattr(self, "fill_" + field.tag_name)
+            filler(name, field, value)
 
 
 class JoomlaAdminDriver(JoomlaFormDriver):
@@ -257,6 +351,7 @@ class JoomlaAdminDriver(JoomlaFormDriver):
         :param web: an eventual selenium browser, if none is provided a new one is spawned
         """
         self.b = Browser(base_url, web)
+        self.b.implicitly_wait(2)
         self.jap = JoomlaAdminParts(self.b)
 
     def login(self, username, passwd):
@@ -288,8 +383,11 @@ class JoomlaAdminDriver(JoomlaFormDriver):
         self.jap.jform_action('article.add').click()
         # fill fields
         for k, v in fields.items():
-            # set according to field type
-            self.fill_field(k, v)
+            if "associations" in k:
+                self.fill_association(k, v)
+            else:
+                # set according to field type
+                self.fill_field(k, v)
         # hit save
         self.jap.jform_action('article.apply').click()
         if self.jap.jform_error:
@@ -302,55 +400,30 @@ class JoomlaAdminDriver(JoomlaFormDriver):
         self.jap.jform_action("article.cancel").click()
         return article_id
 
-
     def modify_article(self, id, fields):
         """Modify an article - NOT WELL TESTED
         """
         self.open_articles()
         # we can't really search for article
-        # get link of action article.edit
+        # get link of action article.edit
         edit_url = self.b.jaction_link("article.edit").get_attribute("href")
-        # change id
+        # change id
         edit_url = update_url_params(edit_url, id=id)
         # go
         self.b.get(self.b.abs_url(edit_url))
         # fill fields
         for k, v in fields.items():
-            # set according to field type
-            self.fill_field(k, v)
+            if "associations" in k:
+                self.fill_association(k, v)
+            else:
+                # set according to field type
+                self.fill_field(k, v)
         # hit save and close
         self.jap.jform_action('article.save').click()
         # verify no error
         if self.jap.jform_error:
             raise AdminError(self.jap.jform_error[0].textContent)
         return id
-
-    def attachment_select_article(self, article_id, article_title):
-        """on attachment form, select an article to attach to
-        """
-        # open article popup
-        self.b.by_xpath("//a[contains(@href, 'function=jSelectArticle')]").click()
-        # wait for popup and select
-        popup_xpath = "//iframe[contains(@src, 'function=jSelectArticle')]"
-        self.b.wait().until(ec_presence((By.XPATH, popup_xpath)))
-        frame = self.b.by_xpath(popup_xpath)
-        self.b.switch_to.frame(frame.elt)
-        # find article id
-        link_xpath = """//a[contains(@onclick, "jSelectArticle('%s'")][1]""" % int(article_id)
-        try:
-            link = self.b.by_xpath(link_xpath)
-        except NoSuchElementException:
-            # search title
-            search_field = self.b.by_name("filter[search]")
-            search_field.clear()
-            search_field.send_keys(article_title)
-            search_field.by_xpath("./following-sibling::button").click()
-            # wait for link
-            link = self.b.wait().until(ec_presence((By.XPATH, link_xpath)))
-        # select article
-        link.click()
-        # wait for window to disapear
-        self.b.wait().until_not(ec_presence((By.XPATH, popup_xpath)))
 
     def add_attachment(self, article_id, article_title, fields):
         """
@@ -365,7 +438,10 @@ class JoomlaAdminDriver(JoomlaFormDriver):
         # new button
         self.jap.jform_action('attachment.add').click()
         # select article
-        self.attachment_select_article(article_id, article_title)
+        # open article popup
+        self.b.by_xpath("//a[contains(@href, 'function=jSelectArticle')]").click()
+        # wait for popup and select
+        self.select_article_in_popup(article_id, article_title)
         # fill fields
         for k, v in fields.items():
             # set according to field type
